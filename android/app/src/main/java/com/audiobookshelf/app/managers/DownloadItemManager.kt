@@ -11,6 +11,7 @@ import com.anggrayudi.storage.file.getAbsolutePath
 import com.anggrayudi.storage.file.moveFileTo
 import com.anggrayudi.storage.media.FileDescription
 import com.audiobookshelf.app.MainActivity
+import com.audiobookshelf.app.download.DownloadService
 import com.audiobookshelf.app.device.DeviceManager
 import com.audiobookshelf.app.device.FolderScanner
 import com.audiobookshelf.app.models.DownloadItem
@@ -22,7 +23,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.*
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -38,6 +39,7 @@ class DownloadItemManager(
   private var jacksonMapper =
           jacksonObjectMapper()
                   .enable(JsonReadFeature.ALLOW_UNESCAPED_CONTROL_CHARS.mappedFeature())
+  private var downloadWatcherJob: Job? = null
 
   enum class DownloadCheckStatus {
     InProgress,
@@ -72,6 +74,8 @@ class DownloadItemManager(
 
     downloadItemQueue.add(downloadItem)
     clientEventEmitter.onDownloadItem(downloadItem)
+    DownloadService.start(mainActivity)
+    updateForegroundNotification()
     checkUpdateDownloadQueue()
   }
 
@@ -150,30 +154,34 @@ class DownloadItemManager(
   private fun startWatchingDownloads() {
     if (isDownloading) return // Already watching
 
-    GlobalScope.launch(Dispatchers.IO) {
-      Log.d(tag, "Starting watching downloads")
-      isDownloading = true
+    isDownloading = true
+    downloadWatcherJob =
+            DownloadService.launchDownloadWork {
+              Log.d(tag, "Starting watching downloads")
 
-      while (currentDownloadItemParts.isNotEmpty()) {
-        val itemParts = currentDownloadItemParts.filter { !it.isMoving }
-        for (downloadItemPart in itemParts) {
-          if (downloadItemPart.isInternalStorage) {
-            handleInternalDownloadPart(downloadItemPart)
-          } else {
-            handleExternalDownloadPart(downloadItemPart)
-          }
-        }
+              while (currentDownloadItemParts.isNotEmpty()) {
+                val itemParts = currentDownloadItemParts.filter { !it.isMoving }
+                for (downloadItemPart in itemParts) {
+                  if (downloadItemPart.isInternalStorage) {
+                    handleInternalDownloadPart(downloadItemPart)
+                  } else {
+                    handleExternalDownloadPart(downloadItemPart)
+                  }
+                }
 
-        delay(500)
+                updateForegroundNotification()
+                delay(500)
 
-        if (currentDownloadItemParts.size < maxSimultaneousDownloads) {
-          checkUpdateDownloadQueue()
-        }
-      }
+                if (currentDownloadItemParts.size < maxSimultaneousDownloads) {
+                  checkUpdateDownloadQueue()
+                }
+              }
 
-      Log.d(tag, "Finished watching downloads")
-      isDownloading = false
-    }
+              updateForegroundNotification()
+              Log.d(tag, "Finished watching downloads")
+              isDownloading = false
+              downloadWatcherJob = null
+            }
   }
 
   /** Handles an internal download part. */
@@ -345,7 +353,7 @@ class DownloadItemManager(
     if (downloadItem.isDownloadFinished) {
       Log.i(tag, "Download Item finished ${downloadItem.media.metadata.title}")
 
-      GlobalScope.launch(Dispatchers.IO) {
+      DownloadService.launchDownloadWork {
         folderScanner.scanDownloadItem(downloadItem) { downloadItemScanResult ->
           Log.d(
                   tag,
@@ -375,9 +383,35 @@ class DownloadItemManager(
             clientEventEmitter.onDownloadItemComplete(jsobj)
             downloadItemQueue.remove(downloadItem)
             DeviceManager.dbManager.removeDownloadItem(downloadItem.id)
+            updateForegroundNotification()
           }
         }
       }
     }
+  }
+
+  private fun updateForegroundNotification() {
+    val activeCount = downloadItemQueue.count { !it.isDownloadFinished }
+
+    val allParts = downloadItemQueue.flatMap { it.downloadItemParts }
+    val totalBytes = allParts.sumOf { part -> part.fileSize.coerceAtLeast(0) }
+    val downloadedBytes =
+            allParts.sumOf { part ->
+              when {
+                part.completed && part.fileSize > 0 -> part.fileSize
+                else -> part.bytesDownloaded
+              }
+            }
+    val boundedDownloaded = if (totalBytes > 0) downloadedBytes.coerceAtMost(totalBytes) else 0
+    val progressPercent =
+            if (totalBytes > 0)
+                    ((boundedDownloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+            else null
+
+    val activeTitles =
+            downloadItemQueue
+                    .filter { !it.isDownloadFinished }
+                    .map { it.itemTitle }
+    DownloadService.updateNotification(progressPercent, activeCount, activeTitles)
   }
 }
